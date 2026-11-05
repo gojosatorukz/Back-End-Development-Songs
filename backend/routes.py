@@ -1,53 +1,70 @@
 from . import app
-import os
 import json
-import pymongo
-from flask import jsonify, request, make_response, abort, url_for  # noqa; F401
+import os
+from pathlib import Path
+from urllib.parse import quote_plus
+from flask import jsonify, request
 from pymongo import MongoClient
 from bson import json_util
-from pymongo.errors import OperationFailure
-from pymongo.results import InsertOneResult
-from bson.objectid import ObjectId
-import sys
-
-SITE_ROOT = os.path.realpath(os.path.dirname(__file__))
-json_url = os.path.join(SITE_ROOT, "data", "songs.json")
-songs_list: list = json.load(open(json_url))
-
-# client = MongoClient(
-#     f"mongodb://{app.config['MONGO_USERNAME']}:{app.config['MONGO_PASSWORD']}@localhost")
-mongodb_service = os.environ.get('MONGODB_SERVICE')
-mongodb_username = os.environ.get('MONGODB_USERNAME')
-mongodb_password = os.environ.get('MONGODB_PASSWORD')
-mongodb_port = os.environ.get('MONGODB_PORT')
-
-print(f'The value of MONGODB_SERVICE is: {mongodb_service}')
-
-if mongodb_service == None:
-    app.logger.error('Missing MongoDB server in the MONGODB_SERVICE variable')
-    # abort(500, 'Missing MongoDB server in the MONGODB_SERVICE variable')
-    sys.exit(1)
-
-if mongodb_username and mongodb_password:
-    url = f"mongodb://{mongodb_username}:{mongodb_password}@{mongodb_service}"
-else:
-    url = f"mongodb://{mongodb_service}"
-
-
-print(f"connecting to url: {url}")
-
-try:
-    client = MongoClient(url)
-except OperationFailure as e:
-    app.logger.error(f"Authentication error: {str(e)}")
-
-db = client.songs
-db.songs.drop()
-db.songs.insert_many(songs_list)
-
-def parse_json(data):
-    return json.loads(json_util.dumps(data))
-
-######################################################################
-# INSERT CODE HERE
-######################################################################
+uri = os.getenv('MONGO_URI')
+if not uri:
+    host=os.environ.get('MONGODB_SERVICE','localhost')
+    user=os.environ.get('MONGODB_USERNAME')
+    password=os.environ.get('MONGODB_PASSWORD')
+    auth=f'{quote_plus(user)}:{quote_plus(password)}@' if user and password else ''
+    uri=f'mongodb://{auth}{host}/?authSource=admin'
+client=MongoClient(uri,serverSelectionTimeoutMS=10000)
+db=client.songs
+collection=db.songs
+collection.create_index('id',unique=True)
+if collection.count_documents({})==0:
+    with open(Path(__file__).parent/'data'/'songs.json',encoding='utf-8') as source:
+        songs_list=json.load(source)
+    if songs_list:
+        collection.insert_many(songs_list)
+def parse_json(value):
+    return json.loads(json_util.dumps(value))
+@app.route('/health')
+def health():
+    client.admin.command('ping')
+    return jsonify(status='OK'),200
+@app.route('/count')
+def count():
+    return jsonify(count=collection.count_documents({})),200
+@app.route('/song',methods=['GET'])
+def get_songs():
+    return jsonify(songs=parse_json(list(collection.find({})))),200
+@app.route('/song/<int:id>',methods=['GET'])
+def get_song_by_id(id):
+    song=collection.find_one({'id':id})
+    if song is None:
+        return jsonify(message='song with id not found'),404
+    return jsonify(parse_json(song)),200
+@app.route('/song',methods=['POST'])
+def create_song():
+    song=request.get_json(silent=True)
+    if not isinstance(song,dict) or not isinstance(song.get('id'),int):
+        return jsonify(message='Invalid input parameter'),400
+    if collection.find_one({'id':song['id']}):
+        return jsonify(Message=f"song with id {song['id']} already present"),302
+    result=collection.insert_one(song)
+    return jsonify(parse_json({'inserted id':result.inserted_id})),201
+@app.route('/song/<int:id>',methods=['PUT'])
+def update_song(id):
+    song=request.get_json(silent=True)
+    if not isinstance(song,dict) or not song:
+        return jsonify(message='Invalid input parameter'),400
+    if collection.find_one({'id':id}) is None:
+        return jsonify(message='song not found'),404
+    song.pop('_id',None)
+    song['id']=id
+    result=collection.update_one({'id':id},{'$set':song})
+    if result.modified_count==0:
+        return jsonify(message='song found, but nothing updated'),200
+    return jsonify(parse_json(collection.find_one({'id':id}))),201
+@app.route('/song/<int:id>',methods=['DELETE'])
+def delete_song(id):
+    result=collection.delete_one({'id':id})
+    if result.deleted_count:
+        return '',204
+    return jsonify(message='song not found'),404
